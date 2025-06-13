@@ -1,0 +1,110 @@
+## Pipeline Function Explanation
+
+This document describes the key components and functions in `pipeline.py`. Each section corresponds to a logically grouped set of operations.
+
+---
+
+### 1. `safe_crop(vol, mask, label, pad=5)`
+
+* **Purpose**: Extracts and normalizes a sub-volume corresponding to a specific region label.
+* **Inputs**:
+
+  * `vol` (`np.ndarray`): 3D CT intensity array.
+  * `mask` (`np.ndarray`): 3D label mask (0=background, 1=tibia, 2=femur).
+  * `label` (`int`): Target label to crop.
+  * `pad` (`int`): Number of voxels to pad around the bounding box.
+* **Process**:
+
+  1. Locate all voxel indices with `mask == label`.
+  2. Compute min/max per axis, apply padding, and clip to volume bounds.
+  3. Crop the sub-volume and normalize to zero mean and unit variance.
+* **Returns**: Normalized sub-volume array of shape `(D, H, W)`.
+
+---
+
+### 2. `KneeVolumeDataset` class
+
+* **Purpose**: PyTorch Dataset wrapper for loading and cropping all three regions.
+* **Key Methods**:
+
+  * `__init__(self, volume_path, mask_path, pad=5)`: Loads volume and mask from NIfTI files.
+  * `__getitem__(self, idx)`: Calls `safe_crop` for labels 1, 2, and 0, returning a dict:
+
+    ```python
+    {
+      'tibia':      cropped_tibia_vol,
+      'femur':      cropped_femur_vol,
+      'background': cropped_background_vol
+    }
+    ```
+
+---
+
+### 3. `convert_module_2d_to_3d(module, depth=3)`
+
+* **Purpose**: Recursively transforms 2D layers into 3D equivalents.
+* **Supported Conversions**:
+
+  * `nn.Conv2d` → `nn.Conv3d`: Repeats 2D kernels along a new depth dimension, normalizing by `depth`.
+  * `nn.BatchNorm2d` → `nn.BatchNorm3d`: Copies batch-norm statistics.
+  * `nn.MaxPool2d` → `nn.MaxPool3d` and `nn.AvgPool2d` → `nn.AvgPool3d`: Adapts kernel/stride/padding parameters.
+* **Recursion**: Non-leaf modules have their children converted in place.
+
+---
+
+### 4. `DenseNet3D` class
+
+* **Purpose**: Builds a 3D DenseNet-121 by inflating a pretrained 2D model.
+* **Constructor**:
+
+  1. **Special `conv0` handling**: Averages RGB channels to collapse to 1 input channel, then inflates to 3D.
+  2. **Sequential Inflation**: Iterates through all subsequent feature blocks, converting via `convert_module_2d_to_3d`.
+* **`forward(self, x)`**:
+
+  * Applies each 3D layer to input tensor `x`.
+  * Captures outputs of every `Conv3d` into a list, which is returned for feature extraction.
+
+---
+
+### 5. `extract_features(model3d, vol, device)`
+
+* **Purpose**: Runs a single region volume through the 3D network and pools feature maps.
+* **Process**:
+
+  1. Convert the 3D NumPy array `vol` to a PyTorch tensor of shape `(1,1,D,H,W)`.
+  2. Perform a forward pass to get a list of all conv-layer outputs.
+  3. Determine indices for the last (`n-1`), 3rd-last (`n-3`), and 5th-last (`n-5`) layers.
+  4. Global-average-pool each selected feature map to a 1D vector.
+  5. Return a dict:
+
+     ```python
+     {
+       'layer_1': vector_from_last,
+       'layer_2': vector_from_3rd_last,
+       'layer_3': vector_from_5th_last
+     }
+     ```
+
+---
+
+### 6. `run_pipeline(vol_path, mask_path, out_csv, device='cpu')`
+
+* **Purpose**: Orchestrates the end-to-end feature extraction and comparison.
+
+* **Steps**:
+
+  1. **Dataset**: Instantiate `KneeVolumeDataset`, load cropped regions.
+  2. **Model**: Load pretrained `DenseNet-121` weights and build `DenseNet3D`.
+  3. **Extract**: Loop over each region (`tibia`, `femur`, `background`) to compute features via `extract_features`.
+  4. **Compare**: For each pair of regions, compute cosine similarity on each layer’s vectors.
+  5. **Save**: Write a CSV `out_csv` with rows `pair,layer_1,layer_2,layer_3`.
+
+* **CLI**: Exposed via `argparse` for easy command-line execution:
+
+  ```bash
+  python pipeline.py --volume <vol.nii.gz> --mask <mask.nii.gz> --output results.csv --device cpu
+  ```
+
+---
+
+This explanation should clarify how each function contributes to the overall processing pipeline, from raw volume & mask input to final similarity outputs.
